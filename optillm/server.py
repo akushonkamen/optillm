@@ -195,6 +195,7 @@ server_config = {
     'log': 'info',
     'ssl_verify': True,
     'ssl_cert_path': '',
+    'readurls_allow_internal': False,
 }
 
 # List of known approaches
@@ -1094,6 +1095,7 @@ def parse_args():
         ("--plugins-dir", "OPTILLM_PLUGINS_DIR", str, "", "Path to the plugins directory"),
         ("--log-conversations", "OPTILLM_LOG_CONVERSATIONS", bool, False, "Enable conversation logging with full metadata"),
         ("--conversation-log-dir", "OPTILLM_CONVERSATION_LOG_DIR", str, str(Path.home() / ".optillm" / "conversations"), "Directory to save conversation logs"),
+        ("--readurls-allow-internal", "OPTILLM_READURLS_ALLOW_INTERNAL", bool, False, "Allow the readurls plugin to fetch non-public/internal URLs (disables SSRF protection)"),
     ]
 
     for arg, env, type_, default, help_text, *extra in args_env:

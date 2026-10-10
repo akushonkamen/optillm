@@ -154,6 +154,23 @@ optillm
 
 ⚠️ **Security Note**: Disabling SSL verification is insecure and should only be used in development. For production environments with custom CAs, use `--ssl-cert-path` instead. See [SSL_CONFIGURATION.md](SSL_CONFIGURATION.md) for details.
 
+## 🔒 URL Fetch Security (readurls plugin)
+
+The `readurls` plugin fetches URLs found in prompts and blocks requests to non-public destinations (private, loopback, link-local, reserved addresses such as the cloud metadata IP `169.254.169.254`) to prevent SSRF. Every redirect hop is re-validated and unresolvable hosts are rejected.
+
+If your deployment intentionally needs to read internal documentation pages, you can explicitly opt out:
+
+```bash
+# Command line
+optillm --readurls-allow-internal
+
+# Environment variable
+export OPTILLM_READURLS_ALLOW_INTERNAL=true
+optillm
+```
+
+⚠️ **Security Note**: Only enable this on trusted networks where internal URL fetching is actually required.
+
 ## Implemented techniques
 
 | Approach                             | Slug               | Description                                                                                    |
