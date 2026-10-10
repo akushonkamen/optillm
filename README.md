@@ -358,6 +358,21 @@ response = client.chat.completions.create(
 )
 ```
 
+The server also exposes the legacy text completions endpoint `POST /v1/completions` (returning `object: "text_completion"` responses), so OpenAI-legacy clients work against the inbuilt inference server too:
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPTILLM_API_KEY" \
+  -d '{
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "prompt": "Write a haiku about recursion.",
+    "max_tokens": 64
+  }'
+```
+
+Streaming (`stream: true`) is not supported on `/v1/completions` yet; use `/v1/chat/completions` for streaming responses.
+
 ### Starting the optillm proxy with an external server (e.g. llama.cpp or ollama)
 
 - Set the `OPENAI_API_KEY` env variable to a placeholder value
