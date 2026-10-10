@@ -185,6 +185,7 @@ optillm
 ```
 
 ⚠️ **Security Note**: Only enable this plugin in single-user, air-gapped environments where the person submitting requests is trusted with full access to the host running optillm.
+**Known limitation (DNS rebinding)**: the guard validates DNS resolution before each request, but the underlying HTTP client performs a second resolution when it opens the connection, so a domain under attacker control could rebind to an internal address between the two lookups. For high-security deployments, additionally restrict the network egress of the optillm process (firewall or service-mesh policy) instead of relying on this check alone.
 
 ## Implemented techniques
 
@@ -389,6 +390,21 @@ response = client.chat.completions.create(
     }
 )
 ```
+
+The server also exposes the legacy text completions endpoint `POST /v1/completions` (returning `object: "text_completion"` responses), so OpenAI-legacy clients work against the inbuilt inference server too:
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPTILLM_API_KEY" \
+  -d '{
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "prompt": "Write a haiku about recursion.",
+    "max_tokens": 64
+  }'
+```
+
+Streaming (`stream: true`) is not supported on `/v1/completions` yet; use `/v1/chat/completions` for streaming responses.
 
 ### Starting the optillm proxy with an external server (e.g. llama.cpp or ollama)
 

@@ -4,6 +4,7 @@ import os
 import secrets
 import time
 import traceback
+import uuid
 from pathlib import Path
 from flask import Flask, request, jsonify
 from cerebras.cloud.sdk import Cerebras
@@ -774,21 +775,64 @@ def check_api_key():
         if not secrets.compare_digest(client_key, server_config['optillm_api_key']):
             return jsonify({"error": "Invalid API key"}), 401
 
-@app.route('/v1/chat/completions', methods=['POST'])
-def proxy():
-    logger.info('Received request to /v1/chat/completions')
-    data = request.get_json()
-    auth_header = request.headers.get("Authorization")
-    bearer_token = ""
+class CompletionError(Exception):
+    """Raised by the shared completion pipeline on processing failure.
+    Endpoints map it to an HTTP 500 JSON response."""
 
-    if auth_header and auth_header.startswith("Bearer "):
-        bearer_token = auth_header.split("Bearer ")[1].strip()
-        logger.debug(f"Intercepted Bearer Token: {bearer_token}")
 
+class CompletionOutcome:
+    """Result of the shared completion pipeline (see _execute_completion).
+
+    response: str, list[str], or a full OpenAI-shaped completion dict passed
+              through from the 'none' approach / a full-response plugin
+              (e.g. proxy) / batch mode
+    completion_tokens: usage count reported by the approach
+    model: dispatch model name (approach-prefixed)
+    passthrough: None on the normal path, 'dict' when response is a
+                 passthrough completion dict, 'batch' for batch mode
+    request_id: conversation logging id (or None)
+    """
+    __slots__ = ('response', 'completion_tokens', 'model', 'passthrough', 'request_id')
+
+    def __init__(self, response, completion_tokens, model, passthrough, request_id):
+        self.response = response
+        self.completion_tokens = completion_tokens
+        self.model = model
+        self.passthrough = passthrough
+        self.request_id = request_id
+
+
+def _normalize_response_texts(response):
+    """Convert tagged conversation output to plain text(s)."""
+    if isinstance(response, list):
+        processed_response = tagged_conversation_to_messages(response)
+        # If processed_response is a list of message lists, extract last message content
+        if processed_response != response:  # Only process if format changed
+            response = [msg[-1]['content'] if isinstance(msg, list) and msg else msg
+                    for msg in processed_response]
+        # Otherwise keep original response
+    else:
+        messages = tagged_conversation_to_messages(response)
+        if isinstance(messages, list) and messages:  # Only process if format changed
+            response = messages[-1]['content']
+    return response
+
+
+def _execute_completion(data: dict, messages: list, bearer_token: str) -> CompletionOutcome:
+    """
+    Shared completion pipeline behind /v1/chat/completions and /v1/completions.
+
+    Parses request_config, resolves the approach/model pair, builds the client
+    and dispatches to the selected approach(es). Request parsing (auth header,
+    prompt/messages extraction) and response shaping stay in the endpoints so
+    each can keep its own protocol shape.
+
+    Raises CompletionError on processing failure; endpoints map that to an
+    HTTP 500 JSON response.
+    """
     logger.debug(f'Request data: {data}')
 
     stream = data.get('stream', False)
-    messages = data.get('messages', [])
     model = data.get('model', server_config['model'])
     n = data.get('n', server_config['n'])  # Get n value from request or config
     # Extract response_format if present
@@ -798,10 +842,6 @@ def proxy():
     # Priority: max_completion_tokens > max_tokens
     max_completion_tokens = data.get('max_completion_tokens')
     max_tokens = data.get('max_tokens')
-
-    # stream_options only applies to our own SSE output; upstream calls are
-    # never streamed and providers reject stream_options without stream=true
-    include_usage = bool((data.get('stream_options') or {}).get('include_usage'))
 
     # Explicit keys that we are already handling
     explicit_keys = {'stream', 'stream_options', 'messages', 'model', 'n', 'response_format', 'max_completion_tokens', 'max_tokens'}
@@ -901,11 +941,11 @@ def proxy():
 
                 logger.debug("Routing request to batch processor")
                 result = request_batcher.add_request(batch_request_data)
-                return jsonify(result), 200
+                return CompletionOutcome(result, 0, model, 'batch', request_id)
 
             except BatchingError as e:
                 logger.error(f"Batch processing failed: {e}")
-                return jsonify({"error": str(e)}), 500
+                raise CompletionError(str(e))
 
         # Check if any of the approaches is 'none'
         contains_none = any(approach == 'none' for approach in approaches)
@@ -921,14 +961,7 @@ def proxy():
                 conversation_logger.log_final_response(request_id, result)
                 conversation_logger.finalize_conversation(request_id)
 
-            if stream:
-                if request_id:
-                    logger.info(f'Request {request_id}: Completed (streaming response)')
-                return Response(generate_streaming_completion(result, model, include_usage), content_type='text/event-stream')
-            else :
-                if request_id:
-                    logger.info(f'Request {request_id}: Completed')
-                return jsonify(result), 200
+            return CompletionOutcome(result, completion_tokens, model, 'dict', request_id)
 
         elif operation == 'AND' or operation == 'OR':
             if contains_none:
@@ -944,15 +977,10 @@ def proxy():
                 conversation_logger.log_final_response(request_id, response)
                 conversation_logger.finalize_conversation(request_id)
 
-            if stream:
-                if request_id:
-                    logger.info(f'Request {request_id}: Completed (streaming response)')
-                return Response(generate_streaming_completion(response, model, include_usage), content_type='text/event-stream')
-            else:
-                if request_id:
-                    logger.info(f'Request {request_id}: Completed')
-                return jsonify(response), 200
+            return CompletionOutcome(response, completion_tokens, model, 'dict', request_id)
 
+    except CompletionError:
+        raise
     except Exception as e:
         # Log error to conversation logger if enabled
         if conversation_logger and request_id:
@@ -963,72 +991,208 @@ def proxy():
         logger.error(f"Error processing request{request_id_str}: {str(e)}")
         if logger.getEffectiveLevel() == logging.DEBUG:
             logger.exception("Debug request exception")
+        raise CompletionError(str(e))
+
+    return CompletionOutcome(response, completion_tokens, model, None, request_id)
+
+
+@app.route('/v1/chat/completions', methods=['POST'])
+def proxy():
+    logger.info('Received request to /v1/chat/completions')
+    data = request.get_json()
+    auth_header = request.headers.get("Authorization")
+    bearer_token = ""
+
+    if auth_header and auth_header.startswith("Bearer "):
+        bearer_token = auth_header.split("Bearer ")[1].strip()
+        logger.debug(f"Intercepted Bearer Token: {bearer_token}")
+
+    messages = data.get('messages', [])
+    stream = data.get('stream', False)
+
+    try:
+        outcome = _execute_completion(data, messages, bearer_token)
+    except CompletionError as e:
         return jsonify({"error": str(e)}), 500
 
-    # Convert tagged conversation to messages format if needed
-    if isinstance(response, list):
-        processed_response = tagged_conversation_to_messages(response)
-        # If processed_response is a list of message lists, extract last message content
-        if processed_response != response:  # Only process if format changed
-            response = [msg[-1]['content'] if isinstance(msg, list) and msg else msg
-                    for msg in processed_response]
-        # Otherwise keep original response
-    else:
-        messages = tagged_conversation_to_messages(response)
-        if isinstance(messages, list) and messages:  # Only process if format changed
-            response = messages[-1]['content']
+    # Batch mode returns the aggregated response as-is (no streaming wrapper,
+    # matching the historical behavior of the batch path)
+    if outcome.passthrough == 'batch':
+        return jsonify(outcome.response), 200
+
+    # stream_options only applies to our own SSE output; upstream calls are
+    # never streamed and providers reject stream_options without stream=true
+    include_usage = bool((data.get('stream_options') or {}).get('include_usage'))
 
     if stream:
-        return Response(generate_streaming_response(response, model), content_type='text/event-stream')
-    else:
-        # Calculate reasoning tokens from the response
-        reasoning_tokens = 0
-        if isinstance(response, str):
-            reasoning_tokens = count_reasoning_tokens(response)
-        elif isinstance(response, list) and response:
-            # For multiple responses, sum up reasoning tokens from all
-            reasoning_tokens = sum(count_reasoning_tokens(resp) for resp in response if isinstance(resp, str))
+        if isinstance(outcome.response, dict):
+            # Full completion dict from the 'none' approach or a full-response plugin
+            if outcome.request_id:
+                logger.info(f'Request {outcome.request_id}: Completed (streaming response)')
+            return Response(generate_streaming_completion(outcome.response, outcome.model, include_usage), content_type='text/event-stream')
+        response = _normalize_response_texts(outcome.response)
+        return Response(generate_streaming_response(response, outcome.model), content_type='text/event-stream')
 
-        response_data = {
-            'model': model,
-            'choices': [],
-            'usage': {
-                'completion_tokens': completion_tokens,
-                'completion_tokens_details': {
-                    'reasoning_tokens': reasoning_tokens
-                }
+    if isinstance(outcome.response, dict):
+        # Full completion dict: return it directly
+        if outcome.request_id:
+            logger.info(f'Request {outcome.request_id}: Completed')
+        return jsonify(outcome.response), 200
+
+    response = _normalize_response_texts(outcome.response)
+
+    # Calculate reasoning tokens from the response
+    reasoning_tokens = 0
+    if isinstance(response, str):
+        reasoning_tokens = count_reasoning_tokens(response)
+    elif isinstance(response, list) and response:
+        # For multiple responses, sum up reasoning tokens from all
+        reasoning_tokens = sum(count_reasoning_tokens(resp) for resp in response if isinstance(resp, str))
+
+    response_data = {
+        'model': outcome.model,
+        'choices': [],
+        'usage': {
+            'completion_tokens': outcome.completion_tokens,
+            'completion_tokens_details': {
+                'reasoning_tokens': reasoning_tokens
             }
         }
+    }
 
-        if isinstance(response, list):
-            for index, resp in enumerate(response):
-                response_data['choices'].append({
-                    'index': index,
-                    'message': {
-                        'role': 'assistant',
-                        'content': resp,
-                    },
-                    'finish_reason': 'stop'
-                })
-        else:
+    if isinstance(response, list):
+        for index, resp in enumerate(response):
             response_data['choices'].append({
-                'index': 0,
+                'index': index,
                 'message': {
                     'role': 'assistant',
-                    'content': response,
+                    'content': resp,
                 },
                 'finish_reason': 'stop'
             })
+    else:
+        response_data['choices'].append({
+            'index': 0,
+            'message': {
+                'role': 'assistant',
+                'content': response,
+            },
+            'finish_reason': 'stop'
+        })
 
-        # Log the final response and finalize conversation logging
-        if conversation_logger and request_id:
-            conversation_logger.log_final_response(request_id, response_data)
-            conversation_logger.finalize_conversation(request_id)
+    # Log the final response and finalize conversation logging
+    if conversation_logger and outcome.request_id:
+        conversation_logger.log_final_response(outcome.request_id, response_data)
+        conversation_logger.finalize_conversation(outcome.request_id)
 
-        logger.debug(f'API response: {response_data}')
-        if request_id:
-            logger.info(f'Request {request_id}: Completed')
-        return jsonify(response_data), 200
+    logger.debug(f'API response: {response_data}')
+    if outcome.request_id:
+        logger.info(f'Request {outcome.request_id}: Completed')
+    return jsonify(response_data), 200
+
+@app.route('/v1/completions', methods=['POST'])
+def completions():
+    """
+    Legacy text completions endpoint, complementing /v1/chat/completions so
+    the built-in inference server also serves OpenAI-legacy clients
+    (issue #170). Reuses the shared completion pipeline; streaming is not
+    supported in this first version.
+    """
+    logger.info('Received request to /v1/completions')
+    data = request.get_json()
+    if data is None:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    auth_header = request.headers.get("Authorization")
+    bearer_token = ""
+
+    if auth_header and auth_header.startswith("Bearer "):
+        bearer_token = auth_header.split("Bearer ")[1].strip()
+        logger.debug(f"Intercepted Bearer Token: {bearer_token}")
+
+    if data.get('stream', False):
+        return jsonify({"error": "stream=true is not supported on /v1/completions yet; use /v1/chat/completions for streaming"}), 400
+
+    prompt = data.get('prompt')
+    if prompt is None:
+        return jsonify({"error": "'prompt' is required for /v1/completions"}), 400
+
+    prompts = prompt if isinstance(prompt, list) else [prompt]
+    if not prompts or not all(isinstance(p, str) for p in prompts):
+        return jsonify({"error": "'prompt' must be a string or a list of strings"}), 400
+
+    # Map each prompt to a single user message and run the shared pipeline
+    # once per prompt (no HTTP self-call). 'prompt' itself is not a chat API
+    # parameter, so it is dropped before dispatch.
+    outcomes = []
+    try:
+        for single_prompt in prompts:
+            request_data = {k: v for k, v in data.items() if k != 'prompt'}
+            request_data['messages'] = [{"role": "user", "content": single_prompt}]
+            outcomes.append(_execute_completion(request_data, request_data['messages'], bearer_token))
+    except CompletionError as e:
+        return jsonify({"error": str(e)}), 500
+
+    choices = []
+    completion_tokens_total = 0
+    reasoning_tokens_total = 0
+    passthrough_usage = None
+    model = outcomes[-1].model
+
+    for outcome in outcomes:
+        if outcome.passthrough is not None:
+            # Full completion dict (batch mode / 'none' approach / full-response
+            # plugin): map chat choices to legacy text choices
+            for choice in outcome.response.get('choices', []):
+                message = choice.get('message') or {}
+                choices.append({
+                    'index': len(choices),
+                    'text': message.get('content', ''),
+                    'logprobs': choice.get('logprobs'),
+                    'finish_reason': choice.get('finish_reason', 'stop'),
+                })
+            if outcome.response.get('usage'):
+                passthrough_usage = outcome.response['usage']
+            continue
+
+        response = _normalize_response_texts(outcome.response)
+        texts = response if isinstance(response, list) else [response]
+        completion_tokens_total += outcome.completion_tokens
+        reasoning_tokens_total += sum(count_reasoning_tokens(text) for text in texts if isinstance(text, str))
+        for text in texts:
+            choices.append({
+                'index': len(choices),
+                'text': text,
+                'logprobs': None,
+                'finish_reason': 'stop',
+            })
+
+    response_data = {
+        'id': f"cmpl-{uuid.uuid4().hex}",
+        'object': 'text_completion',
+        'created': int(time.time()),
+        'model': model,
+        'choices': choices,
+        'usage': passthrough_usage if passthrough_usage is not None else {
+            'completion_tokens': completion_tokens_total,
+            'completion_tokens_details': {
+                'reasoning_tokens': reasoning_tokens_total
+            }
+        }
+    }
+
+    # Log the final response and finalize conversation logging for the normal
+    # path (passthrough paths are logged and finalized inside the pipeline)
+    for outcome in outcomes:
+        if conversation_logger and outcome.request_id and outcome.passthrough is None:
+            conversation_logger.log_final_response(outcome.request_id, response_data)
+            conversation_logger.finalize_conversation(outcome.request_id)
+
+    logger.debug(f'API response: {response_data}')
+    for outcome in outcomes:
+        if outcome.request_id:
+            logger.info(f'Request {outcome.request_id}: Completed')
+    return jsonify(response_data), 200
 
 @app.route('/v1/models', methods=['GET'])
 def proxy_models():
