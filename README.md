@@ -171,6 +171,8 @@ optillm
 
 ⚠️ **Security Note**: Only enable this on trusted networks where internal URL fetching is actually required.
 
+**Known limitation (DNS rebinding)**: the guard validates DNS resolution before each request, but the underlying HTTP client performs a second resolution when it opens the connection, so a domain under attacker control could rebind to an internal address between the two lookups. For high-security deployments, additionally restrict the network egress of the optillm process (firewall or service-mesh policy) instead of relying on this check alone.
+
 ## Implemented techniques
 
 | Approach                             | Slug               | Description                                                                                    |

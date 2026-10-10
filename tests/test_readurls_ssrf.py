@@ -101,6 +101,26 @@ class TestIsBlockedHost(unittest.TestCase):
                    return_value=_addrinfo('93.184.216.34')):
             self.assertFalse(_is_blocked_host('https://example.com/article'))
 
+    def test_blocks_cgnat_shared_range(self):
+        """100.64.0.0/10 (carrier-grade NAT, e.g. Tailscale) is not globally
+        routable even though it is outside the classic private ranges."""
+        from optillm.plugins.readurls_plugin import _is_blocked_host
+        self.assertTrue(_is_blocked_host('http://100.64.0.1/'))
+        self.assertTrue(_is_blocked_host('http://100.100.100.100/'))
+
+    def test_blocks_multicast(self):
+        """Multicast ranges are marked global by ipaddress but must be blocked."""
+        from optillm.plugins.readurls_plugin import _is_blocked_host
+        self.assertTrue(_is_blocked_host('http://224.0.0.1/'))
+        self.assertTrue(_is_blocked_host('http://[ff02::1]/'))
+
+    def test_blocks_empty_resolution(self):
+        """An empty resolution result must fail closed, not be allowed."""
+        from optillm.plugins.readurls_plugin import _is_blocked_host
+        with patch('optillm.plugins.readurls_plugin.socket.getaddrinfo',
+                   return_value=[]):
+            self.assertTrue(_is_blocked_host('http://example.com/'))
+
 
 class TestFetchWebpageContentGuard(unittest.TestCase):
     """Behavior tests: fetch_webpage_content refuses non-public URLs."""

@@ -19,9 +19,16 @@ MAX_REDIRECTS = 5
 def _is_blocked_host(url: str) -> bool:
     """
     SSRF guard: return True when the URL does not point at a globally
-    reachable public address (private, loopback, link-local, reserved,
-    multicast or unspecified), or when the host cannot be resolved
-    (fail-closed).
+    reachable public address (loopback, private, link-local, reserved,
+    CGNAT/shared space, multicast or unspecified), or when the host cannot
+    be resolved (fail-closed).
+
+    Known limitation (DNS rebinding): the host is resolved here and the HTTP
+    client performs a second resolution when it opens the connection, so a
+    domain under attacker control could rebind to an internal address between
+    the two lookups. For high-security deployments, additionally restrict the
+    network egress of the optillm process instead of relying on this check
+    alone.
     """
     try:
         hostname = urlparse(url).hostname
@@ -30,10 +37,17 @@ def _is_blocked_host(url: str) -> bool:
 
         # Resolve all addresses for the host and block the URL if any of
         # them is non-public
-        for addr_info in socket.getaddrinfo(hostname, None):
+        addr_infos = socket.getaddrinfo(hostname, None)
+        if not addr_infos:
+            # No resolution results: fail closed
+            return True
+        for addr_info in addr_infos:
             ip = ipaddress.ip_address(addr_info[4][0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local or
-                    ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            # ipaddress marks globally-routable multicast ranges as global,
+            # so multicast must be blocked explicitly. CGNAT/shared space
+            # (100.64.0.0/10, e.g. Tailscale) is not in the classic private
+            # ranges but is not globally routable either.
+            if ip.is_multicast or not ip.is_global:
                 return True
         return False
     except (OSError, ValueError, UnicodeError):
