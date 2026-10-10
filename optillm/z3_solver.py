@@ -20,21 +20,26 @@ class TimeoutException(Exception):
 # exactly the modules execute_code_in_process() makes available.
 _ALLOWED_SOLVER_IMPORTS = {'z3', 'sympy', 'math', 'itertools', 'fractions'}
 
-# Calls that provide arbitrary execution or file/IO access; the declared
-# solver subset has no use for any of them.
+# Calls that provide arbitrary execution or file/IO access, or that reach the
+# same denied attributes through string arguments (getattr/setattr/delattr);
+# the declared solver subset has no use for any of them.
 _DENIED_SOLVER_CALLS = {
     'eval', 'exec', 'compile', '__import__', 'open', 'input', 'breakpoint',
-    'globals', 'locals', 'vars',
+    'globals', 'locals', 'vars', 'getattr', 'setattr', 'delattr',
 }
 
 # Dunder attributes used in classic module-object traversal escapes (e.g.
-# z3.__loader__, ().__class__.__bases__[0].__subclasses__()). A fixed
-# denylist instead of banning every dunder so legitimate solver code that
-# touches z3/sympy internals by name is not rejected.
+# z3.__loader__, ().__class__.__bases__[0].__subclasses__()). __dict__ and
+# __getattribute__ are denied because they turn every other denied attribute
+# into a string lookup (z3.__dict__['__loader__'],
+# z3.__getattribute__('__spec__')), and a module's __dict__ exposes its real
+# __builtins__. A fixed denylist instead of banning every dunder so legitimate
+# solver code that touches z3/sympy internals by name is not rejected.
 _DENIED_SOLVER_ATTRS = {
     '__class__', '__bases__', '__subclasses__', '__mro__', '__globals__',
     '__builtins__', '__init__', '__code__', '__closure__', '__loader__',
-    '__spec__', '__import__', '__reduce__',
+    '__spec__', '__import__', '__reduce__', '__dict__', '__getattribute__',
+    '__getattr__', '__setattr__', '__delattr__',
 }
 
 def _validate_solver_ast(tree: ast.AST) -> None:

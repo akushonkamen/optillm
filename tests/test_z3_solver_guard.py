@@ -60,6 +60,16 @@ def _response(content, completion_tokens=10):
     ("sympy.__spec__", "__spec__"),
     ("f = z3.Bool.__init__", "__init__"),
     ("import z3\nz3.__builtins__", "__builtins__"),
+    # String-based evasions of the attribute denylist (QA finding): getattr
+    # reaches the same objects via a constant argument, and __dict__ /
+    # __getattribute__ turn every dunder into a string lookup. A module's
+    # __dict__ also exposes its real __builtins__.
+    ("getattr(z3, '__loader__')", "getattr()"),
+    ("setattr(z3, '__loader__', None)", "setattr()"),
+    ("delattr(z3, 'Int')", "delattr()"),
+    ("z3.__dict__['__builtins__']['__import__']('os')", "__dict__"),
+    ("z3.__getattribute__('__spec__')", "__getattribute__"),
+    ("sympy.__getattr__('_load')", "__getattr__"),
 ])
 def test_guard_rejects(code, violation):
     with pytest.raises(ValueError) as excinfo:
